@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
+    <title>My First WebGPU App</title>
+</head>
+<body>
+    <canvas></canvas>
+    <script type="module">
+
+        const GRID_SIZE = 128;
+        //const GRID_SIZE = 128;
+        const UPDATE_INTERVAL = 50; // Update every 200ms (5 times/sec)
+        const WORKGROUP_SIZE = 8; // 8x8 workgroups
+        let step = 0; // Track how many simulation steps have been run
+        const CELL_INFO_SIZE = 4 * 4; // u32 values each of size 4 bytes
+        const BUFFER_SIZE = GRID_SIZE * GRID_SIZE * CELL_INFO_SIZE;
+
+        /*
+            Here's the device
+        */
+
+        if(!navigator.gpu){
+            console.error("WebGPU is not supported.");
+        }
+
+        const adapter = await navigator.gpu.requestAdapter();
+
+        if(!adapter){
+            console.error("Failed to find a suitable GPU adapter.");
+        }
+
+        const device = await adapter.requestDevice();
+
+        /*
+            Here's how I want the device to process data
+        */
+
+        const vertexFragmentShaderModule = device.createShaderModule({
+            label: "Cell Shader",
+            code:
+            `
+                struct VertexInput {
+                    @location(0) pos: vec2f,
+                    @builtin(instance_index) instance: u32,
+                };
+
+                struct VertexOutput {
+                    @builtin(position) pos: vec4f,
+                    @location(0) cell: vec2f,
+                };
+
+                @group(0) @binding(0) var<uniform> grid: vec2f;
+                @group(0) @binding(1) var<storage> cellState: array<f32>;
+
+                @vertex
+                fn vertexMain(input: VertexInput) -> VertexOutput{                     
+
+                    let i = f32(input.instance);
+                    let cell = vec2f(i % grid.x, floor(i / grid.x));
+                    let state = cellState[input.instance];
+
+                    let cellOffset = cell / grid * 2;
+                    let gridPos = (input.pos*state + 1 ) / grid - 1 + cellOffset;
+
+                    var output: VertexOutput;
+                    output.pos = vec4f(gridPos, 0, 1);
+                    output.cell = cell;
+                    return output;
+                }
+
+                @fragment
+                fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                    let c = input.cell/grid;
+                    return vec4f(c, 1-c.x, 1);
+                }
+            `
+        });
+
+        const computeShaderModule = device.createShaderModule({
+            label: 'Game of Life Simulation Shader',
+            code:
+            `
+                @group(0) @binding(0) var<uniform> grid: vec2f;
+                @group(0) @binding(1) var<storage> cellStateIn: array<f32>;
+                @group(0) @binding(2) var<storage, read_write> cellStateOut: array<f32>;
+                @group(0) @binding(3) var<storage, read_write> output: array<CellInfo>;
+
+                struct CellInfo {
+                    position: vec2u,
+                    newCellState: f32,
+                }
+
+                fn getCellIndex(cell: vec2u) -> u32 {
+                    return (cell.y % u32(grid.y)) * u32(grid.x) +
+                        (cell.x % u32(grid.x));
+                }
+
+                fn getCellState(x: u32, y: u32) -> f32 {
+                    return cellStateIn[getCellIndex(vec2(x, y))];
+                }
+
+                fn sigmoid_a(x: f32, a: f32, b: f32) -> f32 {
+                    return 1.0 / (1.0 + exp(-(x - a) * 4 / b));
+                }
+
+                fn sigmoid_b(x: f32, b: f32, eb: f32) -> f32 {
+                    return 1.0 - sigmoid_a(x, b, eb);
+                }
+
+                fn sigmoid_ab(x: f32, a: f32, b: f32, ea: f32, eb: f32) -> f32 {
+                     return sigmoid_a(x, a, ea) * sigmoid_b(x, b, eb);
+                }
+
+                fn sigmoid_mix(x: f32, y: f32, m: f32, em: f32) -> f32 {
+                    return x * (1.0 - sigmoid_a(m, 0.5, em)) + y * sigmoid_a(m, 0.5, em);
+                }
+
+                // SmoothLifeL
+                fn transition_function(innerKernelStateSumsNormalized: f32, outerKernelStateSumsNormalized: f32) -> f32 {
+                    var b1: f32 = 0.278;
+                    var b2: f32 = 0.365;
+                    var d1: f32 = 0.267;
+                    var d2: f32 = 0.445;
+                    var alpha_m: f32 = 0.147;
+                    var alpha_n: f32 = 0.028;
+                    return sigmoid_mix(sigmoid_ab(innerKernelStateSumsNormalized, b1, b2, alpha_m, alpha_n),
+                                       sigmoid_ab(innerKernelStateSumsNormalized, d1, d2, alpha_m, alpha_n), 
+                                       outerKernelStateSumsNormalized, 
+                                       alpha_m
+                            );
+                }
+
+                fn sigmoidInterval(x: f32, a: f32, b: f32, alpha: f32) -> f32 {
+                    return sigmoid_a(x, alpha, b) * (1.0 - sigmoid_a(x, alpha, b));
+                }
+
+                @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+                fn computeMain(
+                        @builtin(global_invocation_id) cell : vec3u,
+                        @builtin(local_invocation_id) local_id : vec3<u32>,
+                    ) {
+                        // Process every cell within range of the current cell.
+                        var innerKernelCellTotal: f32 = 0;
+                        var innerKernelStateSum: f32 = 0;
+                        var innerKernelStateNormalized: f32 = 0;
+                        var outerKernelCellTotal: f32 = 0;
+                        var outerKernelStateSum: f32 = 0;
+                        var outerKernelStateNormalized: f32 = 0;
+                        var r: i32 = 6;
+
+                        for (var x = -r; x <= r; x++) {
+                            for (var y = -r; y <= r; y++) {
+                                let dx: f32 = f32(x - i32(cell.x));
+                                let dy: f32 = f32(y - i32(cell.y));
+                                let d: f32 = sqrt(dx * dx + dy * dy);
+                                let weight: f32 = abs((f32(r) - d) / f32(r));
+
+                                let neighborState = getCellState(cell.x + u32(x), cell.y + u32(y));
+
+                                // Check if it's the center cell, if so, update counts and continue to avoid double counting.
+                                if (x == 0 && y == 0) {
+                                    innerKernelCellTotal = innerKernelCellTotal + weight;
+                                    innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
+                                    continue;
+                                }
+
+                                // Check for immediate neighbors
+                                if ((x == -1 || x == 1 || x == 0) && (y == -1 || y == 1 || y == 0)) {
+                                    innerKernelCellTotal = innerKernelCellTotal + weight;
+                                    innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
+                                } else {
+                                    outerKernelCellTotal = outerKernelCellTotal + weight;
+                                    outerKernelStateSum = outerKernelStateSum + (weight * neighborState);
+                                }
+                            }
+                        }
+
+                        // Normalize the state sums
+                        innerKernelStateNormalized = innerKernelStateSum / innerKernelCellTotal;
+                        outerKernelStateNormalized = outerKernelStateSum / outerKernelCellTotal;
+
+                        var b1: f32 = 0.25;
+                        var b2: f32 = 0.36;
+                        var d1: f32 = 0.36;
+                        var d2: f32 = 0.46;
+                        var alpha_m: f32 = 0.147;
+                        var alpha_n: f32 = 0.028;
+                        var newCellState: f32 = 0;
+
+                        let cellIndex = getCellIndex(cell.xy);
+                        let cellState = getCellState(cell.x, cell.y);
+
+                        var aliveness_a: f32 = sigmoid_a(innerKernelStateNormalized, 0.5, alpha_m);
+                        var aliveness_b: f32 = sigmoid_b(outerKernelStateNormalized, 0.5, alpha_n);
+                        var aliveness_c: f32 = sigmoid_ab(innerKernelStateNormalized, b1, b2, alpha_m, alpha_m);
+                        var aliveness_d: f32 = sigmoid_mix(aliveness_a, aliveness_b, outerKernelStateNormalized, alpha_m);
+
+                        // var aliveness_e: f32 = sigmoid_mix(sigmoid_ab(innerKernelStateNormalized, b1, b2, alpha_m, alpha_n),
+                        //                                    sigmoid_ab(innerKernelStateNormalized, d1, d2, alpha_m, alpha_n), 
+                        //                                    outerKernelStateNormalized, 
+                        //                                    alpha_m
+                        //                                    );
+                                                           
+                        cellStateOut[cellIndex] = aliveness_d;
+
+                        // Initialize the cell info.
+                        var cellInfo: CellInfo = CellInfo(cell.xy, 0);
+
+                        cellInfo = CellInfo(
+                                            cell.xy, 
+                                            innerKernelStateNormalized, 
+                        );
+
+                        output[getCellIndex(cell.xy)] = cellInfo;
+                }   
+            `
+        })
+
+        /*
+            Here are the resources the device will use, with their structure
+        */
+
+        const resourceCollectionLayout = device.createBindGroupLayout({
+            label: "Cell Bind Group Layout",
+            entries: [{
+                // Grid Size uniform buffer
+                binding: 0,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+                buffer: {} // Defaults to uniform
+            }, {
+                // Cell state input buffer
+                binding: 1,
+                visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE,
+                buffer: { type: "read-only-storage"}
+            }, {
+                // Cell state output buffer
+                binding: 2,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage"} 
+            }, {
+                // Console log debug buffer
+                binding: 3,
+                visibility: GPUShaderStage.COMPUTE,
+                buffer: { type: "storage",},
+            }]
+        });
+
+        const cellVertexBufferLayout = {
+            arrayStride: 8,
+            attributes: [{
+                format: "float32x2",
+                offset: 0,
+                shaderLocation: 0,
+            }],
+        };
+
+        /*
+            Here are the resources
+        */
+        
+        const cellVertexArray = new Float32Array([
+            -0.8, -0.8,
+             0.8, -0.8,
+             0.8,  0.8,
+
+            -0.8, -0.8,
+             0.8,  0.8,
+            -0.8,  0.8,     
+        ]);
+
+        const cellVertexBuffer = device.createBuffer({
+            label: "Cell cellVertexArray",
+            size: cellVertexArray.byteLength,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+        });
+
+        device.queue.writeBuffer(cellVertexBuffer, /*bufferOffset=*/0, cellVertexArray);
+
+        const gridSizeUniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
+
+        const gridSizeUniformBuffer = device.createBuffer({
+            label: "Grid Size Uniform",
+            size: gridSizeUniformArray.byteLength,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        })
+
+        device.queue.writeBuffer(gridSizeUniformBuffer, /*bufferOffset=*/0, gridSizeUniformArray);
+
+        const cellStateArray = new Float32Array(GRID_SIZE * GRID_SIZE);
+        
+        for (let i = 0; i < cellStateArray.length; ++i) {
+            //cellStateArray[i] = Math.random() > 0.6 ? 1 : 0;
+            cellStateArray[i] = Math.random();
+        }
+
+        const cellStateInputBuffer = device.createBuffer({
+            label: "Cell State Input Buffer",
+            size: cellStateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        })
+
+        device.queue.writeBuffer(cellStateInputBuffer, 0, cellStateArray);
+        
+        for (let i = 0; i < cellStateArray.length; i++) {
+            //cellStateArray[i] = i % 2;
+            cellStateArray[i] = Math.random();
+        }
+
+        const cellStateOutputBuffer = device.createBuffer({
+            label: "Cell State Output Buffer",
+            size: cellStateArray.byteLength,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        })
+
+        device.queue.writeBuffer(cellStateOutputBuffer, 0, cellStateArray);
+        
+        const consoleDebugBuffer = device.createBuffer({
+            size: BUFFER_SIZE,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
+
+        const stagingBuffer = device.createBuffer({
+            size: BUFFER_SIZE,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+
+        /*
+            Here is the mapping of the resources to the resource structure
+        */
+
+        const resourceCollections = [
+            device.createBindGroup({
+                label: "Cell renderer bind group A",
+                layout: resourceCollectionLayout, 
+                entries: 
+                    [{
+                        binding: 0,
+                        resource: { buffer: gridSizeUniformBuffer }
+                    },
+                    {
+                        binding: 1,
+                        resource: { buffer: cellStateInputBuffer }
+                    },
+                    {
+                        binding: 2,
+                        resource: { buffer: cellStateOutputBuffer }
+                    },
+                    {
+                        binding: 3,
+                        resource: { buffer: consoleDebugBuffer }
+                    }],
+            }),
+            device.createBindGroup({
+                label: "Cell renderer bind group B",
+                layout: resourceCollectionLayout, 
+                entries: 
+                    [{
+                        binding: 0,
+                        resource: { buffer: gridSizeUniformBuffer }
+                    },
+                    {
+                        binding: 1,
+                        resource: { buffer: cellStateOutputBuffer }
+                    },
+                    {
+                        binding: 2,
+                        resource: { buffer: cellStateInputBuffer }
+                    },
+                    {
+                        binding: 3,
+                        resource: { buffer: consoleDebugBuffer }
+                    }],
+            }),
+        ];
+
+        /*
+            Here is the canvas that we want to render to
+        */
+
+        let canvas = document.querySelector("canvas");
+        canvas.setAttribute("width", window.innerWidth);
+        canvas.setAttribute("height", window.innerWidth);
+        const context = canvas.getContext("webgpu");
+        const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({
+            device: device,
+            format: canvasFormat,
+        });
+
+        /*
+            Here are all the resource structures, before we hand them over to the pipelines
+        */
+
+        const pipelineLayout = device.createPipelineLayout({
+            label: "Cell Pipeline Layout",
+            bindGroupLayouts: [ resourceCollectionLayout ],
+        });
+
+        /*
+            Here are the pipelines, with instructions on how to process the data, and their respective resource structures,
+            which have been map to their resources
+        */
+
+        const renderPipeline = device.createRenderPipeline({
+            label: "Render Cells Pipeline",
+            layout: pipelineLayout,
+            vertex: {
+                module: vertexFragmentShaderModule,
+                entryPoint: "vertexMain",
+                buffers: [cellVertexBufferLayout]
+            },
+            fragment: {
+                module: vertexFragmentShaderModule,
+                entryPoint: "fragmentMain",
+                targets: [{
+                format: canvasFormat
+                }]
+            }
+        });
+
+        const computePipeline = device.createComputePipeline({
+            label: "Compute Cell State Pipeline",
+            layout: pipelineLayout,
+            compute: {
+                module: computeShaderModule,
+                entryPoint: "computeMain",
+            }
+        });
+
+        function extractStructuredData(buffer) {
+            const TOTAL_CELLS = buffer.byteLength / CELL_INFO_SIZE;
+            const view = new DataView(buffer);
+
+            console.log(TOTAL_CELLS);
+            console.log(CELL_INFO_SIZE);
+            console.log(view);
+
+
+            const cells = [];
+
+            for (let getCellIndex = 0; getCellIndex < TOTAL_CELLS; getCellIndex++) {
+                const baseOffset = getCellIndex * CELL_INFO_SIZE;
+
+                const cell = {
+                    position: {
+                        x: view.getUint32(baseOffset, true),
+                        y: view.getUint32(baseOffset + 4, true) // Move 4 bytes ahead for the y value
+                    },
+                    newCellState: view.getFloat32(baseOffset + 8, true),
+                };
+
+                cells.push(cell);
+            }
+
+            return cells;
+        }
+        
+        async function renderLoop(){
+
+            const encoder = device.createCommandEncoder();
+
+            const computePass = encoder.beginComputePass();
+            computePass.setPipeline(computePipeline);
+            computePass.setBindGroup(0, resourceCollections[step % 2]);
+            const workgroupCount = Math.ceil(GRID_SIZE / WORKGROUP_SIZE);
+            computePass.dispatchWorkgroups(workgroupCount, workgroupCount);
+            computePass.end();
+
+            encoder.copyBufferToBuffer(
+                consoleDebugBuffer,
+                0,
+                stagingBuffer,
+                0,
+                BUFFER_SIZE
+            );
+
+            step++; 
+
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: context.getCurrentTexture().createView(),
+                    loadOp: "clear",
+                    clearValue: { r: 0, g: 0, b: 0.4, a: 1 },
+                    storeOp: "store",
+                }]
+            });
+
+            pass.setPipeline(renderPipeline);
+            pass.setBindGroup(0, resourceCollections[step % 2]);
+            pass.setVertexBuffer(0, cellVertexBuffer);
+            pass.draw(cellVertexArray.length / 2, GRID_SIZE * GRID_SIZE);
+
+            pass.end();
+
+            device.queue.submit([encoder.finish()]);
+
+            await stagingBuffer.mapAsync(
+                        GPUMapMode.READ,
+                        0,
+                        BUFFER_SIZE
+                    );
+                const copyArrayBuffer = stagingBuffer.getMappedRange(0, BUFFER_SIZE);
+                const data = copyArrayBuffer.slice();
+
+                stagingBuffer.unmap();
+
+                //const structuredData = extractStructuredData(data);
+                //console.log(structuredData);
+
+        }
+        setInterval(renderLoop, UPDATE_INTERVAL);
+        //renderLoop();
+        // Wait for the GPU to finish rendering before submitting another frame
+        //await device.queue.onSubmittedWorkDone();
+        //requestAnimationFrame(renderLoop);
+    </script>
+</body>
+</html>
