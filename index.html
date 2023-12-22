@@ -172,13 +172,12 @@
 
                                 let logres: f32 = 4.0;
 
-                                // The weight is calculated as the absolute value of the normalized difference between the radius 'r' and 'dist_from_center'.
-                                // This means that cells closer to the edge of the radius 'r' will have a higher weight, and those closer to the center cell will have a lower weight.
-                                // The division by 'f32(r)' normalizes the difference, ensuring the weight is a fraction between 0 and 1.
-                                // The use of 'abs' ensures that the weight is always positive.
+                                // The weight is calculated as 1 minus the normalized distance from the center.
+                                // The normalization is done by dividing 'dist_from_center' by 'f32(r)', making it a fraction between 0 and 1.
+                                // Subtracting this value from 1 ensures that a cell right at the center (dist_from_center = 0) has the maximum weight (1),
+                                // and a cell at the edge of the radius (dist_from_center = r) has the minimum weight (0).
 
-                                let weight: f32 = abs((f32(r) - dist_from_center) / f32(r));
-                                // let weight: f32 = 1.0 - (dist_from_center / f32(r));
+                                let weight: f32 = 1.0 - (dist_from_center / f32(r));
 
                                 let neighborState = getCellState(cell.x + u32(x), cell.y + u32(y));
 
