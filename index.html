@@ -40,8 +40,7 @@
 
         const vertexFragmentShaderModule = device.createShaderModule({
             label: "Cell Shader",
-            code:
-            `
+            code:/* wgsl */`
                 struct VertexInput {
                     @location(0) pos: vec2f,
                     @builtin(instance_index) instance: u32,
@@ -81,7 +80,7 @@
 
         const computeShaderModule = device.createShaderModule({
             label: 'Game of Life Simulation Shader',
-            code:
+            code:/* wgsl */
             `
                 @group(0) @binding(0) var<uniform> grid: vec2f;
                 @group(0) @binding(1) var<storage> cellStateIn: array<f32>;
@@ -118,19 +117,23 @@
                     return x * (1.0 - sigmoid_a(m, 0.5, em)) + y * sigmoid_a(m, 0.5, em);
                 }
 
-                // SmoothLifeL
-                fn transition_function(innerKernelStateSumsNormalized: f32, outerKernelStateSumsNormalized: f32) -> f32 {
-                    var b1: f32 = 0.278;
-                    var b2: f32 = 0.365;
-                    var d1: f32 = 0.267;
-                    var d2: f32 = 0.445;
-                    var alpha_m: f32 = 0.147;
-                    var alpha_n: f32 = 0.028;
-                    return sigmoid_mix(sigmoid_ab(innerKernelStateSumsNormalized, b1, b2, alpha_m, alpha_n),
-                                       sigmoid_ab(innerKernelStateSumsNormalized, d1, d2, alpha_m, alpha_n), 
-                                       outerKernelStateSumsNormalized, 
-                                       alpha_m
-                            );
+                fn logistic_threshold(x: f32, x0: f32, alpha: f32) -> f32 {
+                    return 1.0 / (1.0 + exp(-4.0 / alpha * (x - x0)));
+                }
+
+                fn logistic_interval(x: f32, a: f32, b: f32, alpha: f32) -> f32 {
+                    return logistic_threshold(x, a, alpha) * (1.0 - logistic_threshold(x, b, alpha));
+                }
+
+                fn lerp(a: f32, b: f32, t: f32) -> f32 {
+                    return (1.0 - t) * a + t * b;
+                }
+
+                // Function to calculate distance between two cells
+                fn calculateDistance(cell: vec2f, neighborCell: vec2f) -> f32 {
+                    let dx: f32 = neighborCell.x - cell.x;
+                    let dy: f32 = neighborCell.y - cell.y;
+                    return sqrt((dx * dx) + (dy * dy));
                 }
 
                 fn sigmoidInterval(x: f32, a: f32, b: f32, alpha: f32) -> f32 {
@@ -149,22 +152,41 @@
                         var outerKernelCellTotal: f32 = 0;
                         var outerKernelStateSum: f32 = 0;
                         var outerKernelStateNormalized: f32 = 0;
-                        var r: i32 = 6;
+                        var innerRadius: f32 = 7.0;
+                        var outerRadius: f32 = innerRadius * 3.0;
+                        var r: i32 = i32(outerRadius);
 
                         for (var x = -r; x <= r; x++) {
                             for (var y = -r; y <= r; y++) {
-                                let dx: f32 = f32(x - i32(cell.x));
-                                let dy: f32 = f32(y - i32(cell.y));
-                                let d: f32 = sqrt(dx * dx + dy * dy);
-                                let weight: f32 = abs((f32(r) - d) / f32(r));
+                                // Calculate the coordinates of a neighboring cell relative to the current cell
+                                // cell.xy contains the current cell coordinates as a vec2 of u32
+                                // x and y are loop variables representing the offset from the current cell
+
+                                let neighborCell: vec2f = vec2f(cell.xy) + vec2f(f32(x), f32(y));
+
+                                // Calculate the distance from the current cell to the neighbor cell
+                                // vec2f(cell.xy) converts the u32 vector to a floating point vector
+                                // This is necessary because calculateDistance expects vec2f parameters
+
+                                let dist_from_center: f32 = calculateDistance(vec2f(cell.xy), neighborCell);
+
+                                let logres: f32 = 4.0;
+
+                                // The weight is calculated as the absolute value of the normalized difference between the radius 'r' and 'dist_from_center'.
+                                // This means that cells closer to the edge of the radius 'r' will have a higher weight, and those closer to the center cell will have a lower weight.
+                                // The division by 'f32(r)' normalizes the difference, ensuring the weight is a fraction between 0 and 1.
+                                // The use of 'abs' ensures that the weight is always positive.
+
+                                let weight: f32 = abs((f32(r) - dist_from_center) / f32(r));
+                                // let weight: f32 = 1.0 - (dist_from_center / f32(r));
 
                                 let neighborState = getCellState(cell.x + u32(x), cell.y + u32(y));
 
                                 // Check if it's the center cell, if so, update counts and continue to avoid double counting.
                                 if (x == 0 && y == 0) {
-                                    innerKernelCellTotal = innerKernelCellTotal + weight;
+                                    innerKernelCellTotal = innerKernelCellTotal + weight; // Calculating the total possible weight
                                     innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
-                                    continue;
+                                    //continue;
                                 }
 
                                 // Check for immediate neighbors
@@ -175,6 +197,16 @@
                                     outerKernelCellTotal = outerKernelCellTotal + weight;
                                     outerKernelStateSum = outerKernelStateSum + (weight * neighborState);
                                 }
+
+                                // // Check for immediate neighbors
+                                // if (x < i32(innerRadius) && y < i32(innerRadius)) {
+                                //     innerKernelCellTotal = innerKernelCellTotal + weight;
+                                //     innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
+                                // } else if (x > i32(innerRadius) && y > i32(innerRadius) && x <= i32(outerRadius) && y <= i32(outerRadius)) {
+                                //     outerKernelCellTotal = outerKernelCellTotal + weight;
+                                //     outerKernelStateSum = outerKernelStateSum + (weight * neighborState);
+                                // }
+
                             }
                         }
 
@@ -198,11 +230,11 @@
                         var aliveness_c: f32 = sigmoid_ab(innerKernelStateNormalized, b1, b2, alpha_m, alpha_m);
                         var aliveness_d: f32 = sigmoid_mix(aliveness_a, aliveness_b, outerKernelStateNormalized, alpha_m);
 
-                        // var aliveness_e: f32 = sigmoid_mix(sigmoid_ab(innerKernelStateNormalized, b1, b2, alpha_m, alpha_n),
-                        //                                    sigmoid_ab(innerKernelStateNormalized, d1, d2, alpha_m, alpha_n), 
-                        //                                    outerKernelStateNormalized, 
-                        //                                    alpha_m
-                        //                                    );
+                        var aliveness_e: f32 = sigmoid_mix(sigmoid_ab(innerKernelStateNormalized, b1, b2, alpha_m, alpha_n),
+                                                           sigmoid_ab(innerKernelStateNormalized, d1, d2, alpha_m, alpha_n), 
+                                                           outerKernelStateNormalized, 
+                                                           alpha_m
+                                                           );
                                                            
                         cellStateOut[cellIndex] = aliveness_d;
 
