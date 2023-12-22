@@ -97,30 +97,30 @@ fn computeMain(
 
                 let neighborState = getCellState(cell.x + u32(x), cell.y + u32(y));
 
-                // Check if it's the center cell, if so, update counts and continue to avoid double counting.
-                if (x == 0 && y == 0) {
-                    innerKernelCellTotal = innerKernelCellTotal + weight; // Calculating the total possible weight
-                    innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
-                    //continue;
-                }
-
-                // Check for immediate neighbors
-                if ((x == -1 || x == 1 || x == 0) && (y == -1 || y == 1 || y == 0)) {
-                    innerKernelCellTotal = innerKernelCellTotal + weight;
-                    innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
-                } else {
-                    outerKernelCellTotal = outerKernelCellTotal + weight;
-                    outerKernelStateSum = outerKernelStateSum + (weight * neighborState);
-                }
+                // // Check if it's the center cell, if so, update counts and continue to avoid double counting.
+                // if (x == 0 && y == 0) {
+                //     innerKernelCellTotal = innerKernelCellTotal + weight; // Calculating the total possible weight
+                //     innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
+                //     //continue;
+                // }
 
                 // // Check for immediate neighbors
-                // if (x < i32(innerRadius) && y < i32(innerRadius)) {
+                // if ((x == -1 || x == 1 || x == 0) && (y == -1 || y == 1 || y == 0)) {
                 //     innerKernelCellTotal = innerKernelCellTotal + weight;
                 //     innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
-                // } else if (x > i32(innerRadius) && y > i32(innerRadius) && x <= i32(outerRadius) && y <= i32(outerRadius)) {
+                // } else {
                 //     outerKernelCellTotal = outerKernelCellTotal + weight;
                 //     outerKernelStateSum = outerKernelStateSum + (weight * neighborState);
                 // }
+
+                // Check for immediate neighbors
+                if (dist_from_center < innerRadius) {
+                    innerKernelCellTotal = innerKernelCellTotal + weight;
+                    innerKernelStateSum = innerKernelStateSum + (weight * neighborState);
+                } else if (dist_from_center > innerRadius && dist_from_center <= outerRadius) {
+                    outerKernelCellTotal = outerKernelCellTotal + weight;
+                    outerKernelStateSum = outerKernelStateSum + (weight * neighborState);
+                }
 
             }
         }
