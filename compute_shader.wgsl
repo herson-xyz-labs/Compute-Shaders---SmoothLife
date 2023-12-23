@@ -26,22 +26,6 @@ fn getCellState(x: u32, y: u32) -> f32 {
     return cellStateIn[getCellIndex(vec2(x, y))];
 }
 
-fn sigmoid_a(x: f32, a: f32, b: f32) -> f32 {
-    return 1.0 / (1.0 + exp(-(x - a) * 4 / b));
-}
-
-fn sigmoid_b(x: f32, b: f32, eb: f32) -> f32 {
-    return 1.0 - sigmoid_a(x, b, eb);
-}
-
-fn sigmoid_ab(x: f32, a: f32, b: f32, ea: f32, eb: f32) -> f32 {
-    return sigmoid_a(x, a, ea) * sigmoid_b(x, b, eb);
-}
-
-fn sigmoid_mix(x: f32, y: f32, m: f32, em: f32) -> f32 {
-    return x * (1.0 - sigmoid_a(m, 0.5, em)) + y * sigmoid_a(m, 0.5, em);
-}
-
 fn logistic_threshold(x: f32, x0: f32, alpha: f32) -> f32 {
     return 1.0 / (1.0 + exp(-4.0 / alpha * (x - x0)));
 }
@@ -94,8 +78,40 @@ fn processCell(cell: vec2u, innerRadius: f32, outerRadius: f32) -> KernelResults
     return results;
 }
 
-fn sigmoidInterval(x: f32, a: f32, b: f32, alpha: f32) -> f32 {
-    return sigmoid_a(x, alpha, b) * (1.0 - sigmoid_a(x, alpha, b));
+fn applyRulesToCell(innerKernelStateNormalized: f32, outerKernelStateNormalized: f32) -> f32 {
+    // // // Original Values
+    // var B1: f32 = 0.278;
+    // var B2: f32 = 0.365;
+    // var D1: f32 = 0.267;
+    // var D2: f32 = 0.445;
+    // var M: f32 = 0.147;
+    // var N: f32 = 0.028;
+
+    // // Version 2
+    // var B1: f32 = 0.278;
+    // var B2: f32 = 0.365;
+    // var D1: f32 = 0.276;
+    // var D2: f32 = 0.445;
+    // var M: f32 = 0.147;
+    // var N: f32 = 0.028;
+
+    // Version 3
+    var B1: f32 = 0.278;
+    var B2: f32 = 0.365;
+    var D1: f32 = 0.287;
+    var D2: f32 = 0.445;
+    var M: f32 = 0.147;
+    var N: f32 = 0.1;
+
+    var aliveness: f32 = logistic_threshold(innerKernelStateNormalized, 0.005, M);
+    var threshold1: f32 = lerp(B1, D1, aliveness);
+    var threshold2: f32 = lerp(B2, D2, aliveness);
+    var new_aliveness: f32 = logistic_interval(outerKernelStateNormalized, threshold1, threshold2, N);
+
+    // Clip new aliveness to be between 0 and 1
+    var newCellState: f32 = clamp(new_aliveness, 0.0, 1.0);
+
+    return newCellState;
 }
 
 @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
@@ -103,35 +119,19 @@ fn computeMain(
         @builtin(global_invocation_id) cell : vec3u,
         @builtin(local_invocation_id) local_id : vec3<u32>,
     ) {
-        var innerRadius: f32 = 7.0;
+        var innerRadius: f32 = 2.0;
         var outerRadius: f32 = innerRadius * 3.0;
-        var kernelResults: KernelResults = processCell(cell.xy, innerRadius, outerRadius);
 
-        var b1: f32 = 0.25;
-        var b2: f32 = 0.36;
-        var d1: f32 = 0.36;
-        var d2: f32 = 0.46;
-        var alpha_m: f32 = 0.147;
-        var alpha_n: f32 = 0.028;
-        var newCellState: f32 = 0;
+        // Current state of the cell
+        var kernelResults: KernelResults = processCell(cell.xy, innerRadius, outerRadius);
+        // New state of the cell
+        var newCellState: f32 = applyRulesToCell(kernelResults.innerKernelStateNormalized, kernelResults.outerKernelStateNormalized);
 
         let cellIndex = getCellIndex(cell.xy);
         let cellState = getCellState(cell.x, cell.y);
 
-        var aliveness_a: f32 = sigmoid_a(kernelResults.innerKernelStateNormalized, 0.5, alpha_m);
-        var aliveness_b: f32 = sigmoid_b(kernelResults.outerKernelStateNormalized, 0.5, alpha_n);
-        var aliveness_c: f32 = sigmoid_ab(kernelResults.innerKernelStateNormalized, b1, b2, alpha_m, alpha_m);
-        var aliveness_d: f32 = sigmoid_mix(aliveness_a, aliveness_b, kernelResults.outerKernelStateNormalized, alpha_m);
+        cellStateOut[cellIndex] = newCellState;
 
-        var aliveness_e: f32 = sigmoid_mix(sigmoid_ab(kernelResults.innerKernelStateNormalized, b1, b2, alpha_m, alpha_n),
-                                        sigmoid_ab(kernelResults.innerKernelStateNormalized, d1, d2, alpha_m, alpha_n), 
-                                        kernelResults.outerKernelStateNormalized, 
-                                        alpha_m
-                                        );
-                                        
-        cellStateOut[cellIndex] = aliveness_d;
-
-        // Initialize the cell info.
         var cellInfo: CellInfo = CellInfo(cell.xy, 0);
 
         cellInfo = CellInfo(

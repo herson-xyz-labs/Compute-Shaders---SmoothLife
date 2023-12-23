@@ -27,7 +27,7 @@
             const vertexFragmentShaderCode = await loadShader('vertex_fragment_shader.wgsl', {});
             const computeShaderCode = await loadShader('compute_shader.wgsl', { WORKGROUP_SIZE });
 
-            const GRID_SIZE = 128;
+            const GRID_SIZE = 256 * 2;
             //const GRID_SIZE = 128;
             const UPDATE_INTERVAL = 50; // Update every 200ms (5 times/sec)
             let step = 0; // Track how many simulation steps have been run

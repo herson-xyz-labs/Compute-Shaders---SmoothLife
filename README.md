@@ -1,3 +1,3 @@
 # Compute-Shaders---SmoothLife
 
-![](/documentation/2023-12-21-4_compressed.gif)
+![](/documentation/2023-12-23-1_compressed.gif)
